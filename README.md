@@ -14,34 +14,9 @@ An AI-powered ad campaign creative tool built with Streamlit. Describe your prod
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    User["User\n(describes campaign idea)"]
-    UI["Streamlit Chat UI\n(app.py)"]
-    Agent["GPT-5-mini Agent\n(agent.py)"]
-    Prompt["System Prompt + Schema\n(prompts.py, schema.py)"]
-    Brief["Creative Brief\n(composition, style, copy)"]
-    BuildPrompt["Build Generation Prompt"]
-
-    User -->|"product, audience,\ngoal, message, tone"| UI
-    UI -->|"conversation"| Agent
-    Prompt -.->|"pipeline rules\n+ field schema"| Agent
-    Agent -->|"Loop 1: collect\nmissing fields"| UI
-    UI -->|"user responds"| Agent
-    Agent -->|"all fields\ncollected"| Brief
-    Brief -->|"user reviews,\napproves or\ngives feedback"| Agent
-    Brief --> BuildPrompt
-
-    subgraph gen["Image Generation (generate.py)"]
-        GPT["GPT Image 1.5\n(OpenAI)\ntext prompt only"]
-        Gemini["Gemini 2.5 Flash\n(Google)\nstyle image + text"]
-    end
-
-    BuildPrompt -->|"text prompt"| GPT
-    BuildPrompt -->|"style image\n+ text prompt"| Gemini
-    GPT --> Output["Ad Campaign Image"]
-    Gemini --> Output
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="Architecture diagram" width="800">
+</p>
 
 ### File Structure
 
