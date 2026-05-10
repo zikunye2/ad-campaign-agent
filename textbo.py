@@ -7,6 +7,8 @@ import math
 import mimetypes
 import os
 import random
+import threading
+import time
 import traceback
 from typing import Any
 
@@ -23,9 +25,10 @@ from agent import (
 from generate import generate_image_gemini, generate_image_openai
 from schema import STYLE_DIR, STYLE_PRESETS
 
-TEXT_MODEL = "gpt-5-nano"
+REFLECTION_MODEL = "gpt-5-nano"
+PROMPT_GENERATION_MODEL = "gpt-4o"
 EVAL_MODEL = "gpt-4o"
-TEXT_REASONING_EFFORT = "minimal"
+REFLECTION_REASONING_EFFORT = "minimal"
 DEFAULT_INITIAL_PROMPTS = 10
 DEFAULT_LOWEST_PROMPTS = 5
 DEFAULT_OPTIMIZATION_STEPS = 10
@@ -39,6 +42,9 @@ MAX_PERSONA_FILES = 5
 MAX_PERSONA_TOKENS = 5000
 PERSONA_DIR = os.path.join(os.path.dirname(__file__), "persona")
 TOURNAMENT_COMPARISONS = 3
+EVAL_CONCURRENCY_LIMIT = 5
+EVAL_REQUEST_RETRIES = 3
+EVAL_RETRY_BASE_SECONDS = 0.75
 DEFAULT_INITIAL_PARALLELISM = 10
 DEFAULT_BASE_CHAIN_PARALLELISM = 10
 DEFAULT_EFFICIENT_TRAJECTORY_PARALLELISM = 10
@@ -56,6 +62,35 @@ Penalize generic product staging, vague audience fit, weak CTA visibility, unrea
 
 
 _PERSONA_CACHE: list[dict[str, str]] | None = None
+_EVAL_REQUEST_SEMAPHORE = threading.BoundedSemaphore(EVAL_CONCURRENCY_LIMIT)
+
+
+def _supports_custom_sampling(model: str) -> bool:
+    """Return whether the model accepts non-default sampling params."""
+    return not model.startswith("gpt-5")
+
+
+def _uses_reasoning_effort(model: str) -> bool:
+    """Return whether the model accepts reasoning-effort controls."""
+    return model.startswith("gpt-5")
+
+
+def _text_request_kwargs(
+    model: str,
+    *,
+    temperature: float,
+    top_p: float | None,
+    max_completion_tokens: int,
+) -> dict[str, Any]:
+    """Return sampling params supported by the configured text model."""
+    params: dict[str, Any] = {"max_completion_tokens": max_completion_tokens}
+    if _uses_reasoning_effort(model):
+        params["reasoning_effort"] = REFLECTION_REASONING_EFFORT
+    if _supports_custom_sampling(model):
+        params["temperature"] = temperature
+    if _supports_custom_sampling(model) and top_p is not None:
+        params["top_p"] = top_p
+    return params
 
 
 def _is_output_limit_error(exc: BaseException) -> bool:
@@ -65,6 +100,54 @@ def _is_output_limit_error(exc: BaseException) -> bool:
         "max_tokens or model output limit" in message
         or "Could not finish the message" in message
     )
+
+
+def _short_error(exc: BaseException) -> str:
+    """Compact exception text for score diagnostics."""
+    message = " ".join(str(exc).split())
+    if len(message) > 500:
+        message = message[:497].rstrip() + "..."
+    return f"{type(exc).__name__}: {message}"
+
+
+def _is_retryable_api_error(exc: BaseException) -> bool:
+    """Return whether an evaluator API failure is likely transient."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    message = str(exc).lower()
+    retry_markers = (
+        "rate limit",
+        "timeout",
+        "timed out",
+        "temporarily",
+        "overloaded",
+        "server error",
+        "connection",
+        "try again",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in message for marker in retry_markers)
+
+
+def _request_eval_completion(client, **kwargs):
+    """Run GPT-4o evaluator calls with bounded concurrency and retries."""
+    last_exc: BaseException | None = None
+    for attempt in range(EVAL_REQUEST_RETRIES):
+        try:
+            with _EVAL_REQUEST_SEMAPHORE:
+                return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= EVAL_REQUEST_RETRIES - 1 or not _is_retryable_api_error(exc):
+                raise
+            delay = EVAL_RETRY_BASE_SECONDS * (2**attempt) + random.random() * 0.25
+            time.sleep(delay)
+    raise last_exc
 
 
 def _failure_probs() -> dict[str, float]:
@@ -115,22 +198,22 @@ def _request_json_object(
     system_prompt: str,
     user_prompt: str | list[dict[str, Any]],
     *,
+    model: str = REFLECTION_MODEL,
     temperature: float = 1.0,
     top_p: float | None = None,
     max_completion_tokens: int = 8192,
 ) -> dict[str, Any]:
-    """Request a JSON object from GPT-5-nano."""
-    request_kwargs = {
-        "temperature": temperature,
-        "max_completion_tokens": max_completion_tokens,
-        "reasoning_effort": TEXT_REASONING_EFFORT,
-    }
-    if top_p is not None:
-        request_kwargs["top_p"] = top_p
+    """Request a JSON object from a text model."""
+    request_kwargs = _text_request_kwargs(
+        model,
+        temperature=temperature,
+        top_p=top_p,
+        max_completion_tokens=max_completion_tokens,
+    )
 
     try:
         response = client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -140,7 +223,7 @@ def _request_json_object(
         )
     except Exception:
         response = client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -155,28 +238,28 @@ def _request_text(
     system_prompt: str,
     user_prompt: str | list[dict[str, Any]],
     *,
+    model: str = REFLECTION_MODEL,
     temperature: float = 1.0,
     top_p: float | None = None,
     max_completion_tokens: int = 4096,
 ) -> str:
-    """Request plain text from GPT-5-nano."""
+    """Request plain text from a text model."""
     token_limits = [max_completion_tokens]
     if max_completion_tokens < 8192:
         token_limits.append(8192)
 
     last_exc: BaseException | None = None
     for token_limit in token_limits:
-        request_kwargs = {
-            "temperature": temperature,
-            "max_completion_tokens": token_limit,
-            "reasoning_effort": TEXT_REASONING_EFFORT,
-        }
-        if top_p is not None:
-            request_kwargs["top_p"] = top_p
+        request_kwargs = _text_request_kwargs(
+            model,
+            temperature=temperature,
+            top_p=top_p,
+            max_completion_tokens=token_limit,
+        )
 
         try:
             response = client.chat.completions.create(
-                model=TEXT_MODEL,
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -531,9 +614,16 @@ def _score_prompt_with_logprobs(
     persona: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Text-only pre-score for prompt selection."""
+    persona_id = persona.get("persona_id") if persona else None
     if persona:
         judge_prompt = f"""PERSONA DATA:
 {_persona_sample_text(persona)}
+
+Campaign context:
+{_campaign_context_text(session_data, sidebar_settings, creative_brief)}
+
+Candidate prompt:
+{prompt}
 
 TASK:
 Return only one item from ["1","2","3","4","5"] for ad effectiveness.
@@ -573,7 +663,8 @@ Use 5 only for unusually strong prompts that are highly specific, cohesive, camp
 Do not explain your answer."""
 
     try:
-        response = client.chat.completions.create(
+        response = _request_eval_completion(
+            client,
             model=EVAL_MODEL,
             messages=[
                 {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
@@ -587,24 +678,33 @@ Do not explain your answer."""
         )
         probs = _extract_digit_probs_from_completion(response)
         mode = "prompt-persona-logprobs" if persona else "prompt-logprobs"
-    except Exception:
-        response = client.chat.completions.create(
-            model=EVAL_MODEL,
-            messages=[
-                {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
-                {"role": "user", "content": judge_prompt},
-            ],
-            temperature=0,
-            max_completion_tokens=8,
-            seed=seed,
-        )
-        probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
-        mode = "prompt-persona-plain" if persona else "prompt-plain"
+        error = None
+    except Exception as logprob_exc:
+        try:
+            response = _request_eval_completion(
+                client,
+                model=EVAL_MODEL,
+                messages=[
+                    {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
+                    {"role": "user", "content": judge_prompt},
+                ],
+                temperature=0,
+                max_completion_tokens=8,
+                seed=seed,
+            )
+            probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
+            mode = "prompt-persona-plain" if persona else "prompt-plain"
+            error = _short_error(logprob_exc)
+        except Exception as plain_exc:
+            probs = _failure_probs()
+            mode = "prompt-persona-fallback" if persona else "prompt-fallback"
+            error = f"logprobs failed: {_short_error(logprob_exc)} | plain failed: {_short_error(plain_exc)}"
     return {
         "score": _score_from_probs(probs),
         "probs": probs,
         "mode": mode,
-        "persona_id": persona.get("persona_id") if persona else None,
+        "persona_id": persona_id,
+        "error": error,
     }
 
 
@@ -620,9 +720,16 @@ def _score_image_with_logprobs(
     persona: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Multimodal score for a rendered advertisement."""
+    persona_id = persona.get("persona_id") if persona else None
     if persona:
         judge_text = f"""PERSONA DATA:
 {_persona_sample_text(persona)}
+
+Campaign context:
+{_campaign_context_text(session_data, sidebar_settings, creative_brief)}
+
+Rendering prompt:
+{prompt}
 
 TASK:
 Return only one item from ["1","2","3","4","5"] for ad effectiveness.
@@ -661,10 +768,42 @@ Use 4 only when the ad shows clear strength across most dimensions without an ob
 Use 5 only for unusually strong ads that look standout, campaign-aligned, and close to production-ready.
 Do not explain your answer."""
 
-    image_url = _path_to_data_url(image_path)
+    try:
+        image_url = _path_to_data_url(image_path)
+    except Exception as image_file_exc:
+        try:
+            fallback = _score_prompt_with_logprobs(
+                client,
+                prompt,
+                session_data,
+                sidebar_settings,
+                creative_brief,
+                seed=seed,
+                persona=persona,
+            )
+            return {
+                "score": fallback["score"],
+                "probs": fallback["probs"],
+                "mode": f"prompt-fallback:{fallback.get('mode', 'unknown')}",
+                "persona_id": persona_id,
+                "error": f"image load failed: {_short_error(image_file_exc)}",
+            }
+        except Exception as prompt_exc:
+            probs = _failure_probs()
+            return {
+                "score": _score_from_probs(probs),
+                "probs": probs,
+                "mode": "image-persona-fallback" if persona else "image-fallback",
+                "persona_id": persona_id,
+                "error": (
+                    f"image load failed: {_short_error(image_file_exc)} | "
+                    f"prompt fallback failed: {_short_error(prompt_exc)}"
+                ),
+            }
 
     try:
-        response = client.chat.completions.create(
+        response = _request_eval_completion(
+            client,
             model=EVAL_MODEL,
             messages=[
                 {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
@@ -684,9 +823,11 @@ Do not explain your answer."""
         )
         probs = _extract_digit_probs_from_completion(response)
         mode = "image-persona-logprobs" if persona else "image-logprobs"
-    except Exception:
+        error = None
+    except Exception as logprob_exc:
         try:
-            response = client.chat.completions.create(
+            response = _request_eval_completion(
+                client,
                 model=EVAL_MODEL,
                 messages=[
                     {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
@@ -704,23 +845,40 @@ Do not explain your answer."""
             )
             probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
             mode = "image-persona-plain" if persona else "image-plain"
-        except Exception:
-            fallback = _score_prompt_with_logprobs(
-                client,
-                prompt,
-                session_data,
-                sidebar_settings,
-                creative_brief,
-                seed=seed,
-                persona=persona,
-            )
-            probs = fallback["probs"]
-            mode = f"prompt-fallback:{fallback.get('mode', 'unknown')}"
+            error = _short_error(logprob_exc)
+        except Exception as image_exc:
+            try:
+                fallback = _score_prompt_with_logprobs(
+                    client,
+                    prompt,
+                    session_data,
+                    sidebar_settings,
+                    creative_brief,
+                    seed=seed,
+                    persona=persona,
+                )
+                probs = fallback["probs"]
+                mode = f"prompt-fallback:{fallback.get('mode', 'unknown')}"
+                error = (
+                    f"image logprobs failed: {_short_error(logprob_exc)} | "
+                    f"image plain failed: {_short_error(image_exc)}"
+                )
+                if fallback.get("error"):
+                    error += f" | prompt fallback: {fallback['error']}"
+            except Exception as prompt_exc:
+                probs = _failure_probs()
+                mode = "image-persona-fallback" if persona else "image-fallback"
+                error = (
+                    f"image logprobs failed: {_short_error(logprob_exc)} | "
+                    f"image plain failed: {_short_error(image_exc)} | "
+                    f"prompt fallback failed: {_short_error(prompt_exc)}"
+                )
     return {
         "score": _score_from_probs(probs),
         "probs": probs,
         "mode": mode,
-        "persona_id": persona.get("persona_id") if persona else None,
+        "persona_id": persona_id,
+        "error": error,
     }
 
 
@@ -791,6 +949,7 @@ def _aggregate_persona_scores(
                 "score_aggregation": "persona-missing",
                 "persona_scores": {},
                 "persona_count": 0,
+                "persona_errors": {},
             }
         fallback = _aggregate_soft_scores(
             fallback_scorer,
@@ -800,26 +959,31 @@ def _aggregate_persona_scores(
         fallback["mode"] = f"{fallback.get('mode', 'unknown')}:no-persona-fallback"
         fallback["persona_scores"] = {}
         fallback["persona_count"] = 0
+        fallback["persona_errors"] = {}
         return fallback
 
     all_probs: list[dict[str, float]] = []
     persona_scores: dict[str, float] = {}
+    persona_errors: dict[str, str] = {}
     mode = None
     for idx, persona in enumerate(personas):
         seed = None if seed_base is None else seed_base + idx
         persona_id = persona.get("persona_id", str(idx + 1))
         try:
             result = scorer(persona, seed)
-        except Exception:
+        except Exception as exc:
             result = {
                 "probs": _failure_probs(),
                 "mode": "persona-fallback",
                 "persona_id": persona_id,
+                "error": _short_error(exc),
             }
 
         probs = result.get("probs") or _failure_probs()
         all_probs.append(probs)
         persona_scores[persona_id] = _score_from_probs(probs)
+        if result.get("error"):
+            persona_errors[persona_id] = str(result["error"])
         mode = result.get("mode") or mode
 
     averaged = {
@@ -839,6 +1003,7 @@ def _aggregate_persona_scores(
         "score_aggregation": aggregation_mode,
         "persona_scores": persona_scores,
         "persona_count": len(personas),
+        "persona_errors": persona_errors,
     }
 
 
@@ -880,6 +1045,7 @@ Requirements:
         client,
         system_prompt,
         user_prompt,
+        model=PROMPT_GENERATION_MODEL,
         temperature=0.8,
         top_p=0.9,
         max_completion_tokens=8192,
@@ -930,6 +1096,7 @@ Task:
         client,
         system_prompt,
         user_prompt,
+        model=PROMPT_GENERATION_MODEL,
         temperature=0.1,
         top_p=0.95,
         max_completion_tokens=4096,
@@ -969,6 +1136,7 @@ Cover composition, lighting, color palette, subject positioning, brand integrati
                 client,
                 system_prompt,
                 user_prompt,
+                model=REFLECTION_MODEL,
                 temperature=0.3,
                 top_p=0.9,
                 max_completion_tokens=4096,
@@ -1010,6 +1178,7 @@ Cover composition, lighting, color palette, subject positioning, brand integrati
             client,
             system_prompt,
             multimodal_content,
+            model=REFLECTION_MODEL,
             temperature=0.3,
             top_p=0.9,
             max_completion_tokens=4096,
@@ -1041,15 +1210,17 @@ Based on the performance analysis above, generate specific, actionable improveme
 
 Focus on implementing the successful visual patterns identified in the analysis while avoiding the ineffective elements.
 
-Provide 3-5 specific, implementable suggestions for improvement. It can be addition of a new prompt part, deletion of an existing prompt part, or rewriting a prompt part.
+Provide 3-5 specific, implementable suggestions for improvement. At least two suggestions must create a meaningful visual change, such as changing the scene, setting, subject action, camera framing, CTA/text placement, product staging, or emotional hook.
+It can be addition of a new prompt part, deletion of an existing prompt part, or rewriting a prompt part.
 Each suggestion should reference insights from the performance analysis.
+Preserve only the campaign invariants: product/service, audience, campaign goal, key message/CTA, brand tone, and style direction. Do not preserve the original scene or composition unless the analysis clearly supports it.
 
 RESPONSE FORMAT:
 1. [Specific improvement suggestion based on performance analysis]
 2. [Specific improvement suggestion based on performance analysis]
 3. [Specific improvement suggestion based on performance analysis]
 
-Be concrete and actionable. Focus on changes that will meaningfully improve ad effectiveness based on the analysis."""
+Be concrete and actionable. Prefer changes large enough to produce visibly different image candidates, not minor wording polish."""
     else:
         user_prompt = f"""You are an expert at optimizing image generation prompts for advertising effectiveness.
 
@@ -1068,21 +1239,23 @@ Consider improvements in:
 5. Brand integration and logo placement
 6. Text overlay space and readability
 
-Provide 3-5 specific, implementable suggestions for improvement.
+Provide 3-5 specific, implementable suggestions for improvement. At least two suggestions must create a meaningful visual change, such as changing the scene, setting, subject action, camera framing, CTA/text placement, product staging, or emotional hook.
 Each suggestion should be concrete and actionable.
+Preserve only the campaign invariants: product/service, audience, campaign goal, key message/CTA, brand tone, and style direction. Do not preserve the original scene or composition by default.
 
 RESPONSE FORMAT:
 1. [Specific improvement suggestion]
 2. [Specific improvement suggestion]
 3. [Specific improvement suggestion]
 
-Be concise but specific. Focus on changes that will meaningfully improve ad effectiveness."""
+Be concise but specific. Prefer changes large enough to produce visibly different image candidates, not minor wording polish."""
 
     try:
         return _request_text(
             client,
             "You generate textual gradients for advertising prompt optimization.",
             user_prompt,
+            model=PROMPT_GENERATION_MODEL,
             temperature=0.8,
             top_p=0.9,
             max_completion_tokens=2048,
@@ -1106,11 +1279,13 @@ IMPROVEMENT SUGGESTIONS:
 {gradient}
 
 TASK:
-Rewrite the prompt incorporating the improvement suggestions while maintaining the core message and structure.
+Create a meaningfully different revised prompt that incorporates the improvement suggestions.
 
 REQUIREMENTS:
-- Keep the prompt structure and format similar to the original.
-- Integrate the improvement suggestions naturally.
+- Preserve the campaign invariants: product/service, audience, campaign goal, key message/CTA, brand tone, style direction, and aspect ratio.
+- Do not preserve the original wording, order, scene, or composition unless it is clearly the strongest choice.
+- Apply at least one substantial visual change to scene, setting, subject action, camera framing, CTA/text placement, product staging, or emotional hook.
+- Integrate the improvement suggestions naturally into a self-contained image-generation prompt.
 - Maintain coherence and readability.
 - Ensure the prompt is optimized for image generation.
 - Keep the prompt length reasonable and under 220 words.
@@ -1121,6 +1296,7 @@ Return ONLY the revised prompt, no explanations or additional text."""
             client,
             "You apply textual gradients to image-generation prompts.",
             user_prompt,
+            model=PROMPT_GENERATION_MODEL,
             temperature=0.1,
             top_p=0.95,
             max_completion_tokens=2048,
@@ -1256,18 +1432,24 @@ def _pairwise_compare_tournament_candidates(
     if not path2 or not os.path.exists(path2):
         return 0, "candidate2-missing-image"
 
-    comparison_prompt = """You are evaluating two mobile advertisement images for effectiveness.
+    comparison_prompt = """You are evaluating two advertisement images for mobile Instagram ads.
+Which image would be more effective at engaging users and driving clicks?
 
 CRITICAL: Return exactly 1 or 2 with no other text.
-- Return 1 if the first image is more effective as an ad.
-- Return 2 if the second image is more effective as an ad."""
+- Return 1 if the first image is more effective.
+- Return 2 if the second image is more effective.
+
+Your response must be exactly one character: either 1 or 2."""
 
     votes_candidate1 = 0
     votes_candidate2 = 0
     fallback_votes = 0
+    image1_url = _path_to_data_url(path1)
+    image2_url = _path_to_data_url(path2)
     for _ in range(max(1, comparisons)):
         try:
-            response = client.chat.completions.create(
+            response = _request_eval_completion(
+                client,
                 model=EVAL_MODEL,
                 messages=[
                     {"role": "system", "content": "Return exactly one token: 1 or 2."},
@@ -1276,9 +1458,9 @@ CRITICAL: Return exactly 1 or 2 with no other text.
                         "content": [
                             {"type": "text", "text": comparison_prompt},
                             {"type": "text", "text": "IMAGE 1:"},
-                            {"type": "image_url", "image_url": {"url": _path_to_data_url(path1)}},
+                            {"type": "image_url", "image_url": {"url": image1_url}},
                             {"type": "text", "text": "IMAGE 2:"},
-                            {"type": "image_url", "image_url": {"url": _path_to_data_url(path2)}},
+                            {"type": "image_url", "image_url": {"url": image2_url}},
                         ],
                     },
                 ],
@@ -1588,6 +1770,7 @@ def _evaluate_initial_candidate(
             "persona_scores": scored.get("persona_scores"),
             "persona_count": scored.get("persona_count"),
             "score_aggregation": scored.get("score_aggregation"),
+            "persona_errors": scored.get("persona_errors"),
         }
     else:
         score = 1.0
@@ -1656,6 +1839,7 @@ def _prescore_efficient_candidate(
             "persona_scores": prompt_scored.get("persona_scores"),
             "persona_count": prompt_scored.get("persona_count"),
             "score_aggregation": prompt_scored.get("score_aggregation"),
+            "persona_errors": prompt_scored.get("persona_errors"),
         },
     }
 
@@ -1768,6 +1952,7 @@ def _run_efficient_trajectory_step(
             "persona_scores": image_scored.get("persona_scores"),
             "persona_count": image_scored.get("persona_count"),
             "score_aggregation": image_scored.get("score_aggregation"),
+            "persona_errors": image_scored.get("persona_errors"),
         }
     else:
         final_score = 3.0
@@ -1775,7 +1960,8 @@ def _run_efficient_trajectory_step(
         final_score_mode = "image-generation-failed"
         final_score_details = None
 
-    accepted = final_score > current["score"]
+    previous_score = current["score"]
+    accepted = final_score > previous_score
     step_entry = _build_candidate_record(
         candidate_id=f"{candidate_id_prefix}_traj{trajectory['trajectory_id']:02d}_step{step:02d}",
         prompt=selected_prompt,
@@ -1797,6 +1983,8 @@ def _run_efficient_trajectory_step(
         step=step,
         trajectory_id=trajectory["trajectory_id"],
     )
+    step_entry["previous_score"] = previous_score
+    step_entry["score_delta"] = final_score - previous_score
     step_entry["candidate_prompts"] = rendered_candidates
     step_entry["shared_reflection"] = shared_reflection
     step_entry["selection_mode"] = f"image-tournament:G={max(1, gradient_steps)}:N={efficient_candidates}"
@@ -1902,6 +2090,7 @@ def _run_base_optimizer_chain(
                 "persona_scores": scored.get("persona_scores"),
                 "persona_count": scored.get("persona_count"),
                 "score_aggregation": scored.get("score_aggregation"),
+                "persona_errors": scored.get("persona_errors"),
             }
         else:
             score = 1.0
@@ -2134,10 +2323,14 @@ def _run_efficient_optimizer(
 
         step_winner_result = max(step_results, key=lambda item: item["step_entry"]["score"])
         step_winner_entry = step_winner_result["step_entry"]
+        accepted_count = sum(1 for item in step_results if item["accepted"])
         step_winner = {
             "step": step,
             "trajectory_id": step_winner_result["trajectory_id"],
             "score": step_winner_entry["score"],
+            "previous_score": step_winner_entry.get("previous_score"),
+            "score_delta": step_winner_entry.get("score_delta"),
+            "accepted": step_winner_result["accepted"],
             "prompt_prescore": step_winner_entry.get("prompt_prescore"),
             "probs": step_winner_entry.get("probs"),
             "score_details": step_winner_entry.get("score_details"),
@@ -2161,7 +2354,10 @@ def _run_efficient_optimizer(
             f"{step_winner['trajectory_id']} | G={step_winner.get('gradient_steps') or gradient_steps} | "
             f"candidates {step_winner.get('tournament_candidate_count') or 0} | "
             f"final score {_format_score(step_winner['score'])} "
-            f"({step_winner.get('score_mode') or 'unknown'})"
+            f"({step_winner.get('score_mode') or 'unknown'}) | "
+            f"{accepted_count}/{len(step_results)} trajectories accepted | "
+            f"winner {'accepted' if step_winner['accepted'] else 'rejected'} "
+            f"({step_winner.get('score_delta', 0.0):+.6f})"
         )
         if report_image and step_winner.get("output_path"):
             report_image(
@@ -2530,6 +2726,11 @@ def _render_persona_score_details(details: dict[str, Any] | None, label: str = "
     if mean_score is not None:
         score_text = f"mean {_format_score(mean_score)} | {score_text}"
     st.caption(f"{label}: {score_text}")
+    persona_errors = details.get("persona_errors") or {}
+    if st.session_state.get("debug_mode") and persona_errors:
+        with st.expander(f"{label} scorer fallbacks", expanded=False):
+            for persona_id, error_text in sorted(persona_errors.items()):
+                st.code(f"pid {persona_id}: {error_text}", language="text")
 
 
 def _format_score(score: float) -> str:
@@ -2959,7 +3160,7 @@ st.markdown(
 )
 
 st.title("Ad Campaign Agent Optimizer")
-st.caption("GPT-5-nano + prompt search + image generation")
+st.caption("GPT-4o prompt generation + GPT-5-nano reflection + image generation")
 
 # ─── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
