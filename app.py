@@ -126,7 +126,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Ad Campaign Agent")
-st.caption("GPT-5-mini + Image Generation")
+st.caption("GPT-5-nano + Image Generation")
 
 # ─── API Keys ──────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-"""GPT-5-mini agent for the Ad Campaign pipeline."""
+"""GPT-5-nano agent for the Ad Campaign pipeline."""
 
 import json
 
@@ -6,6 +6,9 @@ from openai import OpenAI
 
 from prompts import SYSTEM_PROMPT
 from schema import validate_fields, format_fields_for_prompt
+
+TEXT_MODEL = "gpt-5-nano"
+TEXT_REASONING_EFFORT = "minimal"
 
 
 def get_openai_client(api_key: str) -> OpenAI:
@@ -57,14 +60,15 @@ def chat(
     session_data: dict,
     sidebar_settings: dict | None = None,
 ) -> str:
-    """Send the conversation to GPT-5-mini and get a response."""
+    """Send the conversation to GPT-5-nano and get a response."""
     messages = _build_messages(conversation_history, session_data, sidebar_settings)
 
     response = client.chat.completions.create(
-        model="gpt-5-mini",
+        model=TEXT_MODEL,
         messages=messages,
         temperature=1,
         max_completion_tokens=65536,
+        reasoning_effort=TEXT_REASONING_EFFORT,
     )
 
     return response.choices[0].message.content or ""
@@ -188,10 +192,11 @@ def extract_fields(
     ]
 
     response = client.chat.completions.create(
-        model="gpt-5-mini",
+        model=TEXT_MODEL,
         messages=messages,
         temperature=1,
         max_completion_tokens=16384,
+        reasoning_effort=TEXT_REASONING_EFFORT,
         response_format={"type": "json_object"},
     )
 
